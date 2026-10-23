@@ -34,6 +34,21 @@ the script falls back to `osascript`, which shows up as Script Editor.
 up the watcher runs the normal off path (the notification says "OFF (timer
 expired)") and the usual sleep and lock behavior comes back.
 
+`supercaffeinate on claude` stays awake while Claude Code sessions are working.
+Every 30 seconds the watcher counts `claude` processes and looks for a
+transcript under `~/.claude/projects` written in the last 15 minutes (Claude
+Code appends to it on every turn and tool call). Once no session is left, or
+none has written for the grace period, it turns off ("OFF (Claude idle for
+15m)"). `on claude 30m` changes the grace. The first check waits one grace
+period, so a fresh start is never judged on stale transcripts.
+
+`supercaffeinate check` prints health as `key=value` lines: whether the
+passwordless `pmset` rule is installed, whether `screenblank` is present,
+whether `pmset disablesleep` is still set while off (for example after a
+reboot), whether the lid watcher is alive, and how many Claude sessions are
+running. The menu bar app reads it when the menu opens. `status` prints the
+same problems as warnings.
+
 ### Lid handling
 
 The display is never allowed to sleep, so the "require password after the
@@ -51,12 +66,23 @@ on what is plugged in:
 ## Menu bar app
 
 `SuperCaffeinate.app` puts a coffee cup in the menu bar: filled when on,
-outline when off, a warning triangle if the state is stale. Click it to see
-how long the Mac has been held awake (or how long is left on a timer) and to
-turn it on or off. Turn On stays on indefinitely; Turn On For... asks for a
-number of hours (0.5 is fine, blank means indefinite). It polls the
-state file every 2 seconds, so changes made from a terminal or a hotkey show up
-right away. It is launched at login by a LaunchAgent. See
+outline when off, a warning triangle if the state is stale or the lid watcher
+died. Click it to see how long the Mac has been held awake (or how long is
+left on a timer, and until when) and to turn it on or off. Turn On stays on
+indefinitely; Turn On For opens a submenu with 30 minutes, 1, 2, 4 and 8
+hours, Until 7:00 AM, and Custom... (a number of hours, 0.5 is fine); Turn On
+While Claude Runs is the `on claude` mode and shows how many sessions are
+running.
+
+The menu also reports problems instead of hiding them: a missing `pmset`
+sudoers rule ("Setup needed", with a Run Setup in Terminal... item), sleep
+still disabled from an earlier session while off (with Restore Normal Sleep),
+a dead watcher (with Repair, which turns off and back on with the same mode
+and remaining time), and the last failure or warning the script printed. Each
+of those is also posted as a notification.
+
+The app polls the state file every 2 seconds, so changes made from a terminal or a
+hotkey show up right away. It is launched at login by a LaunchAgent. See
 [menubar/README.md](menubar/README.md) for details.
 
 ## Install
@@ -81,16 +107,20 @@ Make sure `~/bin` is on your `PATH`.
 
 ## Usage
 
-    supercaffeinate on [DURATION]
+    supercaffeinate on [DURATION | claude [GRACE]]
     supercaffeinate off
-    supercaffeinate toggle [DURATION]
+    supercaffeinate toggle [DURATION | claude [GRACE]]
     supercaffeinate status
+    supercaffeinate check
 
 DURATION is optional. Leave it out (or pass `0`, `inf`, `infinite` or
 `forever`) to stay awake until `off`. Otherwise it is hours, minutes and
 seconds such as `8h`, `90m`, `2h30m` or `45s`, or a bare number of minutes
 (`45`). When the timer runs out supercaffeinate turns itself off. `status`
-shows the time left, e.g. `auto-off in 7h 42m (at 19:35)`.
+shows the time left, e.g. `auto-off in 7h 42m (at 19:35)`. `claude` instead
+of a duration stays awake while Claude Code sessions are active, with an
+optional GRACE (default `15m`, minimum `1m`) before an idle session counts as
+done.
 
 `toggle` is safe to fire from a hotkey with no terminal: a lock prevents rapid
 presses from stacking. To bind it to a key, point Karabiner-Elements,

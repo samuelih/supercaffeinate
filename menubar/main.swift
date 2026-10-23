@@ -2,34 +2,42 @@
 //
 // State model matches the script exactly. /tmp/supercaffeinate.state holds
 // the "caffeinate -ims" pid, the previous screensaver idleTime, the lid
-// watcher pid, and (line 4, optional) the auto-off deadline in epoch seconds,
-// 0 or missing when there is no timer. The script's is_on() is "file exists AND kill -0
+// watcher pid, the auto-off deadline in epoch seconds (line 4, 0 or missing
+// when there is no timer), the mode (line 5, "claude" or empty) and the Claude
+// grace in seconds (line 6). The script's is_on() is "file exists AND kill -0
 // pid succeeds", so a state file whose pid is dead is neither on nor off, it
 // is broken, and this app says so instead of guessing.
+//
+// Health (sudoers rule, stale pmset disablesleep, watcher alive, Claude
+// sessions) comes from `supercaffeinate check`, run when the menu opens and
+// once at launch. Script failures and warnings are captured from stderr and
+// shown in the menu and as a notification instead of being dropped.
 
 import AppKit
 import UserNotifications
 
 let statePath = "/tmp/supercaffeinate.state"
-// Written by the script's timer-expiry path just before it turns off; read and
+// Written by the script's auto-off path just before it turns off; read and
 // deleted here when the off transition is seen, so the notification can say why.
 let offReasonPath = "/tmp/supercaffeinate.offreason"
 let scriptPath = NSHomeDirectory() + "/bin/supercaffeinate"
+let setupPath = NSHomeDirectory() + "/bin/supercaffeinate-setup"
 
 enum CaffState: Equatable {
     case off
-    case on(pid: pid_t, since: Date?, deadline: Date?)
+    case on(pid: pid_t, since: Date?, deadline: Date?, mode: String, grace: Int, watcherAlive: Bool)
     case broken(pid: pid_t)
 }
 
-// Cheap poll: one stat plus one kill(pid, 0). No subprocesses on the tick.
+// Cheap poll: one stat plus one kill(pid, 0) per pid. No subprocesses on the tick.
 func readState() -> CaffState {
     var st = stat()
     guard stat(statePath, &st) == 0 else { return .off }
 
     guard let text = try? String(contentsOfFile: statePath, encoding: .utf8) else { return .off }
     let lines = text.split(separator: "\n", omittingEmptySubsequences: false)
-    guard let first = lines.first, let pid = pid_t(first.trimmingCharacters(in: .whitespaces)), pid > 0 else {
+        .map { $0.trimmingCharacters(in: .whitespaces) }
+    guard let first = lines.first, let pid = pid_t(first), pid > 0 else {
         return .off
     }
 
@@ -39,33 +47,50 @@ func readState() -> CaffState {
 
     // Line 4: auto-off deadline, absent or 0 when the session is indefinite.
     var deadline: Date?
-    if lines.count > 3, let secs = TimeInterval(lines[3].trimmingCharacters(in: .whitespaces)), secs > 0 {
+    if lines.count > 3, let secs = TimeInterval(lines[3]), secs > 0 {
         deadline = Date(timeIntervalSince1970: secs)
+    }
+    let mode = lines.count > 4 ? lines[4] : ""
+    let grace = lines.count > 5 ? (Int(lines[5]) ?? 900) : 900
+
+    // Line 3: the lid watcher. If it died the display hold, lid blackout,
+    // timer and Claude checks are all gone even though caffeinate is alive.
+    var watcherAlive = false
+    if lines.count > 2, let wpid = pid_t(lines[2]), wpid > 0 {
+        watcherAlive = kill(wpid, 0) == 0
     }
 
     if kill(pid, 0) == 0 {
-        return .on(pid: pid, since: since, deadline: deadline)
+        return .on(pid: pid, since: since, deadline: deadline, mode: mode, grace: grace, watcherAlive: watcherAlive)
     }
     return .broken(pid: pid)
 }
 
-// Runs ioreg with the given arguments and returns its stdout. Only used when
-// the menu is about to open, never on a poll tick.
-func ioreg(_ args: [String]) -> String {
+// Runs an executable and returns stdout, stderr and the exit code. Only used
+// when the menu is about to open or an action runs, never on a poll tick.
+func capture(_ path: String, _ args: [String]) -> (out: String, err: String, status: Int32) {
     let proc = Process()
-    proc.executableURL = URL(fileURLWithPath: "/usr/sbin/ioreg")
+    proc.executableURL = URL(fileURLWithPath: path)
     proc.arguments = args
-    let pipe = Pipe()
-    proc.standardOutput = pipe
-    proc.standardError = FileHandle.nullDevice
+    let outPipe = Pipe()
+    let errPipe = Pipe()
+    proc.standardOutput = outPipe
+    proc.standardError = errPipe
     do {
         try proc.run()
     } catch {
-        return ""
+        return ("", "could not run \(path): \(error.localizedDescription)", 127)
     }
-    let data = pipe.fileHandleForReading.readDataToEndOfFile()
+    let outData = outPipe.fileHandleForReading.readDataToEndOfFile()
+    let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
     proc.waitUntilExit()
-    return String(data: data, encoding: .utf8) ?? ""
+    return (String(data: outData, encoding: .utf8) ?? "",
+            String(data: errData, encoding: .utf8) ?? "",
+            proc.terminationStatus)
+}
+
+func ioreg(_ args: [String]) -> String {
+    capture("/usr/sbin/ioreg", args).out
 }
 
 func lidClosed() -> Bool {
@@ -77,6 +102,17 @@ func lidClosed() -> Bool {
 // In that case the script skips the lid-closed blank (clamshell mode).
 func externalDisplayOnline() -> Bool {
     ioreg(["-r", "-c", "DCPAVServiceProxy", "-d", "1"]).contains("\"Location\" = \"External\"")
+}
+
+// `supercaffeinate check` as a dictionary (sudoers, screenblank, sleepdisabled,
+// state, watcher, mode, grace, claude_sessions, claude_active).
+func readHealth() -> [String: String] {
+    var h: [String: String] = [:]
+    for line in capture(scriptPath, ["check"]).out.split(separator: "\n") {
+        guard let eq = line.firstIndex(of: "=") else { continue }
+        h[String(line[..<eq])] = String(line[line.index(after: eq)...]).trimmingCharacters(in: .whitespaces)
+    }
+    return h
 }
 
 // Seconds to "7h 42m", "8h", "45m" (minutes rounded up), or "30s" under a
@@ -91,6 +127,24 @@ func formatDuration(_ secs: Int) -> String {
     return "\(m)m"
 }
 
+// Whole minutes from now until the next occurrence of HH:MM local time.
+func minutesUntilNext(hour: Int, minute: Int) -> Int {
+    let cal = Calendar.current
+    let now = Date()
+    var target = cal.date(bySettingHour: hour, minute: minute, second: 0, of: now) ?? now
+    if target <= now { target = cal.date(byAdding: .day, value: 1, to: target) ?? target }
+    return max(1, Int((target.timeIntervalSince(now) / 60).rounded(.up)))
+}
+
+// Duration presets in the Turn On For submenu: title and the script argument.
+let presets: [(String, String)] = [
+    ("30 minutes", "30m"),
+    ("1 hour", "1h"),
+    ("2 hours", "2h"),
+    ("4 hours", "4h"),
+    ("8 hours", "8h"),
+]
+
 final class Controller: NSObject, NSMenuDelegate, UNUserNotificationCenterDelegate {
     let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     let menu = NSMenu()
@@ -100,6 +154,11 @@ final class Controller: NSObject, NSMenuDelegate, UNUserNotificationCenterDelega
     // False until the first poll has seeded the state, so launching the app
     // never posts a notification for a switch it did not see happen.
     var seeded = false
+    // Last failure or warning from the script, shown in the menu until the
+    // next clean run.
+    var lastProblem: String?
+    // Health from `supercaffeinate check`, refreshed when the menu opens.
+    var health: [String: String] = [:]
 
     override init() {
         super.init()
@@ -145,12 +204,31 @@ final class Controller: NSObject, NSMenuDelegate, UNUserNotificationCenterDelega
         }
     }
 
+    // One health pass at launch, off the main thread: a missing sudoers rule
+    // or a stale disablesleep after a reboot is worth a banner right away.
+    func startupHealthCheck() {
+        DispatchQueue.global(qos: .utility).async {
+            let h = readHealth()
+            DispatchQueue.main.async {
+                self.health = h
+                if h["sudoers"] == "missing" {
+                    self.post("Setup needed: lid close can still sleep the Mac. Run supercaffeinate-setup.")
+                }
+                if h["state"] == "off" && h["sleepdisabled"] == "1" {
+                    self.post("Sleep is still disabled from an earlier session. Use Restore Normal Sleep.")
+                }
+            }
+        }
+    }
+
     func notifyTransition(from old: CaffState, to new: CaffState) {
         switch (old, new) {
         case (.on, .on), (.off, .off), (.broken, .broken), (.off, .broken):
             return
-        case (_, .on(_, let since, let deadline)):
-            if let deadline = deadline, let since = since {
+        case (_, .on(_, let since, let deadline, let mode, _, _)):
+            if mode == "claude" {
+                post("ON while Claude runs")
+            } else if let deadline = deadline, let since = since {
                 let secs = Int(deadline.timeIntervalSince1970 - since.timeIntervalSince1970)
                 post("ON for " + formatDuration(secs))
             } else {
@@ -202,9 +280,10 @@ final class Controller: NSObject, NSMenuDelegate, UNUserNotificationCenterDelega
     func describe(_ s: CaffState) -> String {
         switch s {
         case .off: return "state=off icon=cup.and.saucer"
-        case .on(let pid, _, let deadline):
+        case .on(let pid, _, let deadline, let mode, _, let watcher):
             let timer = deadline.map { " deadline=\(Int($0.timeIntervalSince1970))" } ?? ""
-            return "state=on pid=\(pid)\(timer) icon=cup.and.saucer.fill"
+            let m = mode.isEmpty ? "" : " mode=\(mode)"
+            return "state=on pid=\(pid)\(timer)\(m) watcher=\(watcher ? "alive" : "dead") icon=cup.and.saucer.fill"
         case .broken(let pid): return "state=broken pid=\(pid) icon=exclamationmark.triangle"
         }
     }
@@ -214,9 +293,9 @@ final class Controller: NSObject, NSMenuDelegate, UNUserNotificationCenterDelega
         let symbol: String
         let describe: String
         switch state {
-        case .on:
-            symbol = "cup.and.saucer.fill"
-            describe = "supercaffeinate is on"
+        case .on(_, _, _, _, _, let watcher):
+            symbol = watcher ? "cup.and.saucer.fill" : "exclamationmark.triangle"
+            describe = watcher ? "supercaffeinate is on" : "supercaffeinate is on but its watcher died"
         case .off:
             symbol = "cup.and.saucer"
             describe = "supercaffeinate is off"
@@ -231,18 +310,24 @@ final class Controller: NSObject, NSMenuDelegate, UNUserNotificationCenterDelega
     }
 
     // Menu contents are rebuilt each time it opens, so nothing is ever stale
-    // and the ioreg lid query only runs on a real open.
+    // and the ioreg and check subprocesses only run on a real open.
     func menuNeedsUpdate(_ menu: NSMenu) {
         refresh(force: true)
+        health = readHealth()
         menu.removeAllItems()
 
         let fmt = DateFormatter()
         fmt.dateFormat = "HH:mm"
+        let sessions = Int(health["claude_sessions"] ?? "") ?? 0
 
         switch state {
-        case .on(_, let since, let deadline):
-            if let deadline = deadline {
-                menu.addItem(disabled("Awake, " + remaining(until: deadline)))
+        case .on(_, let since, let deadline, let mode, let grace, let watcherAlive):
+            if mode == "claude" {
+                let act = health["claude_active"] == "yes" ? "active" : "idle"
+                menu.addItem(disabled("Awake while Claude runs: \(sessions) session\(sessions == 1 ? "" : "s"), \(act)"))
+                menu.addItem(disabled("Turns off after \(formatDuration(grace)) idle"))
+            } else if let deadline = deadline {
+                menu.addItem(disabled("Awake, " + remaining(until: deadline) + " (until " + fmt.string(from: deadline) + ")"))
             } else {
                 // No timer: the infinity sign marks an indefinite session.
                 let when = since.map { ", since " + fmt.string(from: $0) } ?? ""
@@ -255,24 +340,54 @@ final class Controller: NSObject, NSMenuDelegate, UNUserNotificationCenterDelega
             } else {
                 menu.addItem(disabled("Lid closed: screen black, system running"))
             }
+            if !watcherAlive {
+                menu.addItem(disabled("\u{26A0} Watcher died: lid, timer and Claude checks are off"))
+            }
         case .off:
             menu.addItem(disabled("Off"))
+            if health["sleepdisabled"] == "1" {
+                menu.addItem(disabled("\u{26A0} Sleep still disabled from an earlier session"))
+            }
         case .broken(let pid):
             menu.addItem(disabled("Broken: state file says pid \(pid), not running"))
-            menu.addItem(disabled("Run supercaffeinate off to clean up"))
+        }
+
+        if health["sudoers"] == "missing" {
+            menu.addItem(disabled("\u{26A0} Setup needed: lid close can still sleep the Mac"))
+        }
+        if health["screenblank"] == "missing" {
+            menu.addItem(disabled("\u{26A0} screenblank missing: run install.sh"))
+        }
+        if let problem = lastProblem {
+            menu.addItem(disabled("Last run: " + problem))
         }
 
         menu.addItem(.separator())
 
         var actions: [NSMenuItem] = []
         switch state {
-        case .on:
+        case .on(_, _, _, _, _, let watcherAlive):
             actions.append(NSMenuItem(title: "Turn Off", action: #selector(turnOff), keyEquivalent: ""))
+            if !watcherAlive {
+                actions.append(NSMenuItem(title: "Repair (Off, then On Again)", action: #selector(repair), keyEquivalent: ""))
+            }
         case .off:
             actions.append(NSMenuItem(title: "Turn On", action: #selector(turnOn), keyEquivalent: ""))
-            actions.append(NSMenuItem(title: "Turn On For...", action: #selector(turnOnFor), keyEquivalent: ""))
+            let forItem = NSMenuItem(title: "Turn On For", action: nil, keyEquivalent: "")
+            forItem.submenu = presetMenu()
+            actions.append(forItem)
+            let claudeTitle = sessions > 0
+                ? "Turn On While Claude Runs (\(sessions) running)"
+                : "Turn On While Claude Runs"
+            actions.append(NSMenuItem(title: claudeTitle, action: #selector(turnOnClaude), keyEquivalent: ""))
+            if health["sleepdisabled"] == "1" {
+                actions.append(NSMenuItem(title: "Restore Normal Sleep", action: #selector(turnOff), keyEquivalent: ""))
+            }
         case .broken:
             actions.append(NSMenuItem(title: "Clean Up (Turn Off)", action: #selector(turnOff), keyEquivalent: ""))
+        }
+        if health["sudoers"] == "missing" {
+            actions.append(NSMenuItem(title: "Run Setup in Terminal...", action: #selector(runSetup), keyEquivalent: ""))
         }
         for action in actions {
             action.target = self
@@ -285,6 +400,28 @@ final class Controller: NSObject, NSMenuDelegate, UNUserNotificationCenterDelega
         let quit = NSMenuItem(title: "Quit", action: #selector(quit), keyEquivalent: "q")
         quit.target = self
         menu.addItem(quit)
+    }
+
+    func presetMenu() -> NSMenu {
+        let sub = NSMenu()
+        for (title, arg) in presets {
+            let mi = NSMenuItem(title: title, action: #selector(turnOnPreset(_:)), keyEquivalent: "")
+            mi.representedObject = arg
+            mi.target = self
+            mi.isEnabled = !busy
+            sub.addItem(mi)
+        }
+        // Evening starts overshoot an 8h timer; morning is the natural end.
+        let morning = NSMenuItem(title: "Until 7:00 AM", action: #selector(turnOnUntilMorning), keyEquivalent: "")
+        morning.target = self
+        morning.isEnabled = !busy
+        sub.addItem(morning)
+        sub.addItem(.separator())
+        let custom = NSMenuItem(title: "Custom...", action: #selector(turnOnFor), keyEquivalent: "")
+        custom.target = self
+        custom.isEnabled = !busy
+        sub.addItem(custom)
+        return sub
     }
 
     // "7h 42m left", minutes rounded up so it never reads 0m while still on.
@@ -303,6 +440,49 @@ final class Controller: NSObject, NSMenuDelegate, UNUserNotificationCenterDelega
 
     @objc func turnOn() { run(["on"]) }
     @objc func turnOff() { run(["off"]) }
+    @objc func turnOnClaude() { run(["on", "claude"]) }
+
+    @objc func turnOnPreset(_ sender: NSMenuItem) {
+        guard let arg = sender.representedObject as? String else { return }
+        run(["on", arg])
+    }
+
+    @objc func turnOnUntilMorning() {
+        run(["on", "\(minutesUntilNext(hour: 7, minute: 0))m"])
+    }
+
+    // Watcher died but caffeinate lives: turn off, then back on with the same
+    // mode and whatever time was left, so the lid and timer handling return.
+    @objc func repair() {
+        guard case .on(_, _, let deadline, let mode, let grace, _) = state else { return }
+        var onArgs = ["on"]
+        if mode == "claude" {
+            onArgs += ["claude", "\(grace)s"]
+        } else if let deadline = deadline {
+            let left = Int(deadline.timeIntervalSinceNow)
+            if left < 60 {
+                run(["off"])
+                return
+            }
+            onArgs.append("\(left)s")
+        }
+        runSequence([["off"], onArgs])
+    }
+
+    // supercaffeinate-setup needs an interactive sudo prompt, so it runs in a
+    // Terminal window rather than here.
+    @objc func runSetup() {
+        let cmd = "tell application \"Terminal\"\nactivate\ndo script \"'" + setupPath + "'\"\nend tell"
+        DispatchQueue.global(qos: .userInitiated).async {
+            let r = capture("/usr/bin/osascript", ["-e", cmd])
+            if r.status != 0 {
+                DispatchQueue.main.async {
+                    self.lastProblem = "could not open Terminal: " + r.err.trimmingCharacters(in: .whitespacesAndNewlines)
+                    self.post(self.lastProblem!)
+                }
+            }
+        }
+    }
 
     // Asks for a number of hours. Empty or 0 means indefinite; anything else
     // must be a number greater than 0 and at most 1000, or the alert comes
@@ -362,21 +542,34 @@ final class Controller: NSObject, NSMenuDelegate, UNUserNotificationCenterDelega
         }
     }
 
+    func run(_ args: [String]) { runSequence([args]) }
+
     // The script can take a moment (sudo pmset, pkill sweeps), so it never
-    // runs on the main thread.
-    func run(_ args: [String]) {
+    // runs on the main thread. A non-zero exit (lock held, bad argument) or a
+    // "warning:" line on stderr (sudo -n pmset failed) becomes a notification
+    // and a menu line instead of vanishing. Several commands run back to back
+    // for repair; the sequence stops at the first failure.
+    func runSequence(_ commands: [[String]]) {
         if busy { return }
         busy = true
         DispatchQueue.global(qos: .userInitiated).async {
-            let proc = Process()
-            proc.executableURL = URL(fileURLWithPath: scriptPath)
-            proc.arguments = args
-            proc.standardOutput = FileHandle.nullDevice
-            proc.standardError = FileHandle.nullDevice
-            try? proc.run()
-            proc.waitUntilExit()
+            var problem: String?
+            for args in commands {
+                let r = capture(scriptPath, args)
+                let errLines = r.err.split(separator: "\n").map { $0.trimmingCharacters(in: .whitespaces) }
+                if r.status != 0 {
+                    let why = errLines.first ?? "exit \(r.status)"
+                    problem = "\(args.joined(separator: " ")) failed: \(why)"
+                    break
+                }
+                if let warn = errLines.first(where: { $0.hasPrefix("warning:") }) {
+                    problem = String(warn.dropFirst("warning:".count)).trimmingCharacters(in: .whitespaces)
+                }
+            }
             DispatchQueue.main.async {
                 self.busy = false
+                self.lastProblem = problem
+                if let p = problem { self.post(p) }
                 self.refresh(force: true)
             }
         }
@@ -392,14 +585,23 @@ app.setActivationPolicy(.accessory)
 let controller = Controller()
 
 // --dump-menu builds the menu exactly as a click would and prints it, so the
-// menu can be checked without clicking anything.
+// menu can be checked without clicking anything. Submenu items are indented.
 if CommandLine.arguments.contains("--dump-menu") {
     controller.menuNeedsUpdate(controller.menu)
-    for mi in controller.menu.items {
-        print(mi.isSeparatorItem ? "---" : mi.title + (mi.isEnabled ? "" : " (disabled)"))
+    func dump(_ m: NSMenu, indent: String) {
+        for mi in m.items {
+            if mi.isSeparatorItem {
+                print(indent + "---")
+                continue
+            }
+            print(indent + mi.title + (mi.isEnabled || mi.submenu != nil ? "" : " (disabled)"))
+            if let sub = mi.submenu { dump(sub, indent: indent + "    ") }
+        }
     }
+    dump(controller.menu, indent: "")
     exit(0)
 }
 
 controller.startNotifications()
+controller.startupHealthCheck()
 app.run()

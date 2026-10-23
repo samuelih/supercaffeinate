@@ -18,6 +18,12 @@
 # timer runs out the watcher runs the normal off path, so the usual sleep and
 # lock behavior comes back. The deadline (epoch seconds, 0 = none) is line 4 of
 # the state file.
+# Claude mode: `on claude [GRACE]` stays awake while Claude Code sessions are
+# active and turns off once no session has written to its transcript for GRACE
+# (default 15m), or no claude process is left. Line 5 of the state file is the
+# mode ("claude" or empty), line 6 the grace in seconds.
+# `check` prints health as key=value lines (sudoers rule, screenblank, stale
+# pmset disablesleep, watcher pid, Claude sessions) for the menu bar app.
 
 STATE=/tmp/supercaffeinate.state
 DCAF_PID=/tmp/supercaffeinate.dcaf.pid
@@ -102,6 +108,32 @@ is_on() {
   [ -f "$STATE" ] && kill -0 "$(head -1 "$STATE")" 2>/dev/null
 }
 
+# Number of Claude Code processes (the `claude` binary, any flags).
+claude_sessions() {
+  pgrep -x claude 2>/dev/null | wc -l | tr -d ' '
+}
+
+# 0 when some Claude session wrote to its transcript within $1 seconds. Claude
+# Code appends to ~/.claude/projects/*/*.jsonl on every turn and tool call, so
+# a quiet transcript means the session is waiting on a human.
+claude_active_within() {
+  local mins=$(( ($1 + 59) / 60 ))
+  [ "$mins" -lt 1 ] && mins=1
+  [ -d "$HOME/.claude/projects" ] || return 1
+  [ -n "$(find "$HOME/.claude/projects" -name '*.jsonl' -mmin "-$mins" 2>/dev/null | head -1)" ]
+}
+
+# 0 when the NOPASSWD rule from supercaffeinate-setup is in place. sudo -n -l
+# on the exact command exits 0 only when it can run without a password.
+sudoers_ok() {
+  sudo -n -l /usr/bin/pmset -a disablesleep 1 >/dev/null 2>&1
+}
+
+# pmset prints "SleepDisabled 1" only while disablesleep is set.
+sleep_disabled() {
+  pmset -g 2>/dev/null | grep -qE '^ *SleepDisabled +1'
+}
+
 # One instance at a time: rapid hotkey presses must not stack instances.
 acquire_lock() {
   if mkdir "$LOCKDIR" 2>/dev/null; then
@@ -146,14 +178,32 @@ unblank_screen() {
 # $1 is the auto-off deadline in epoch seconds (0 or empty = none). When it
 # passes, a detached "__expire" run does the normal off path and this loop
 # exits, so off never has to kill the process it is running in.
+# $2 is the mode ("claude" or empty) and $3 the Claude grace in seconds. In
+# claude mode the session check runs every 30 s once the session is older
+# than the grace, so a fresh start is never judged on stale transcripts.
 lid_watcher() {
   was_blank=""
   deadline=${1:-0}
+  mode=${2:-}
+  grace=${3:-900}
+  started=$(date +%s)
+  tick=0
   while true; do
-    if [ "$deadline" -gt 0 ] && [ "$(date +%s)" -ge "$deadline" ]; then
-      "$0" __expire </dev/null >>/tmp/supercaffeinate.log 2>&1 &
+    now=$(date +%s)
+    if [ "$deadline" -gt 0 ] && [ "$now" -ge "$deadline" ]; then
+      "$0" __expire "timer expired" </dev/null >>/tmp/supercaffeinate.log 2>&1 &
       exit 0
     fi
+    if [ "$mode" = claude ] && [ $(( tick % 30 )) -eq 0 ] && [ $(( now - started )) -ge "$grace" ]; then
+      if [ "$(claude_sessions)" -eq 0 ]; then
+        "$0" __expire "no Claude sessions" </dev/null >>/tmp/supercaffeinate.log 2>&1 &
+        exit 0
+      elif ! claude_active_within "$grace"; then
+        "$0" __expire "Claude idle for $(fmt_duration "$grace")" </dev/null >>/tmp/supercaffeinate.log 2>&1 &
+        exit 0
+      fi
+    fi
+    tick=$(( tick + 1 ))
 
     # Always keep the display-hold caffeinate alive.
     if [ ! -f "$DCAF_PID" ] || ! kill -0 "$(cat "$DCAF_PID")" 2>/dev/null; then
@@ -177,6 +227,15 @@ lid_watcher() {
 status() {
   if [ -f "$STATE" ]; then
     echo "supercaffeinate is ON (pid $(head -1 "$STATE"))"
+    WATCHPID=$(sed -n 3p "$STATE")
+    if ! kill -0 "$WATCHPID" 2>/dev/null; then
+      echo "warning: lid watcher (pid $WATCHPID) is not running; lid, timer and Claude checks are off. Run supercaffeinate off, then on."
+    fi
+    if [ "$(sed -n 5p "$STATE")" = claude ]; then
+      GRACE=$(sed -n 6p "$STATE")
+      if claude_active_within "${GRACE:-900}"; then ACT=active; else ACT=idle; fi
+      echo "while Claude runs: $(claude_sessions) session(s), $ACT; off after $(fmt_duration "${GRACE:-900}") idle"
+    fi
     if lid_closed; then
       if external_display_online; then
         echo "lid closed: showing on external display (no blank), system running"
@@ -196,12 +255,43 @@ status() {
     fi
   else
     echo "supercaffeinate is OFF"
+    if sleep_disabled; then
+      echo "warning: pmset disablesleep is still 1 (left over from an earlier session or a reboot). Run supercaffeinate off to clear it."
+    fi
+  fi
+  if ! sudoers_ok; then
+    echo "warning: no passwordless pmset rule; lid close can still sleep the machine. Run supercaffeinate-setup once."
   fi
 }
 
+# Health as key=value lines. Read by the menu bar app when its menu opens.
+check() {
+  if sudoers_ok; then echo sudoers=ok; else echo sudoers=missing; fi
+  if [ -x "$SCREENBLANK" ]; then echo screenblank=ok; else echo screenblank=missing; fi
+  if sleep_disabled; then echo sleepdisabled=1; else echo sleepdisabled=0; fi
+  if [ -f "$STATE" ]; then
+    if is_on; then echo state=on; else echo state=broken; fi
+    WATCHPID=$(sed -n 3p "$STATE")
+    if kill -0 "$WATCHPID" 2>/dev/null; then echo watcher=alive; else echo watcher=dead; fi
+    echo "mode=$(sed -n 5p "$STATE")"
+    echo "grace=$(sed -n 6p "$STATE")"
+  else
+    echo state=off
+    echo watcher=none
+    echo mode=
+    echo grace=
+  fi
+  GRACE=$(sed -n 6p "$STATE" 2>/dev/null)
+  echo "claude_sessions=$(claude_sessions)"
+  if claude_active_within "${GRACE:-900}"; then echo claude_active=yes; else echo claude_active=no; fi
+}
+
 # $1 = timer length in seconds, 0 or empty = no timer.
+# $2 = mode ("claude" or empty), $3 = Claude grace in seconds.
 do_on() {
   DUR=${1:-0}
+  MODE=${2:-}
+  GRACE=${3:-900}
   if is_on; then
     echo "Already on."
     return 0
@@ -221,12 +311,13 @@ do_on() {
   DEADLINE=0
   [ "$DUR" -gt 0 ] && DEADLINE=$(( $(date +%s) + DUR ))
 
-  "$0" __watch "$DEADLINE" &
+  "$0" __watch "$DEADLINE" "$MODE" "$GRACE" &
   WATCHPID=$!
 
   # Write state FIRST so even a partially failed on can be toggled off.
-  # Lines 1 to 3 are read by the menu bar app; line 4 is the auto-off deadline.
-  printf '%s\n%s\n%s\n%s\n' "$CAFPID" "$PREV_IDLE" "$WATCHPID" "$DEADLINE" > "$STATE"
+  # Lines 1 to 3 are read by the menu bar app; line 4 is the auto-off deadline,
+  # line 5 the mode, line 6 the Claude grace in seconds.
+  printf '%s\n%s\n%s\n%s\n%s\n%s\n' "$CAFPID" "$PREV_IDLE" "$WATCHPID" "$DEADLINE" "$MODE" "$GRACE" > "$STATE"
 
   defaults -currentHost write com.apple.screensaver idleTime -int 0
 
@@ -239,7 +330,10 @@ do_on() {
   echo "ON. No sleep, no screensaver, no auto-lock."
   echo "Lid open: display stays on. Lid closed: screen dims to black, work keeps running."
   echo "External display connected: lid-closed blank is skipped so the external screen stays on."
-  if [ "$DEADLINE" -gt 0 ]; then
+  if [ "$MODE" = claude ]; then
+    echo "While Claude runs: $(claude_sessions) session(s) now. Turns off once no session has been active for $(fmt_duration "$GRACE")."
+    notify "ON while Claude runs"
+  elif [ "$DEADLINE" -gt 0 ]; then
     echo "Auto-off at $(date -r "$DEADLINE" +%H:%M) (in $(fmt_duration "$DUR"))."
     notify "ON for $(fmt_duration "$DUR")"
   else
@@ -286,36 +380,50 @@ do_off() {
   notify "OFF$REASON"
 }
 
-# Validate the duration before touching any state.
+# Validate the arguments before touching any state.
+# `on claude [GRACE]` is Claude mode; otherwise `on [DURATION]`.
+MODE=""
+DUR_SECS=0
+GRACE_SECS=900
 if [ "$1" = on ] || [ "$1" = toggle ]; then
-  if ! DUR_SECS=$(parse_duration "$2"); then
-    echo "invalid duration: $2 (examples: 8h, 90m, 2h30m, 45)" >&2
+  if [ "$2" = claude ]; then
+    MODE=claude
+    if [ -n "$3" ]; then
+      if ! GRACE_SECS=$(parse_duration "$3") || [ "$GRACE_SECS" -lt 60 ]; then
+        echo "invalid grace: $3 (at least 1m; examples: 15m, 30m, 1h)" >&2
+        exit 1
+      fi
+    fi
+  elif ! DUR_SECS=$(parse_duration "$2"); then
+    echo "invalid duration: $2 (examples: 8h, 90m, 2h30m, 45, or claude [GRACE])" >&2
     exit 1
   fi
 fi
 
 case "$1" in
   __watch)
-    lid_watcher "$2"
+    lid_watcher "$2" "$3" "$4"
     ;;
 
   __expire)
-    # Started by the watcher when the timer runs out. Wait out a concurrent
-    # run (hotkey, menu bar) rather than dropping the auto-off.
+    # Started by the watcher when the timer runs out or Claude goes quiet
+    # ($2 is the reason). Wait out a concurrent run (hotkey, menu bar) rather
+    # than dropping the auto-off.
+    WHY=${2:-timer expired}
     for _ in 1 2 3 4 5 6 7 8 9 10; do
       acquire_lock 2>/dev/null && break
       sleep 1
     done
     [ -d "$LOCKDIR" ] && [ "$(cat "$LOCKDIR/pid" 2>/dev/null)" = "$$" ] || exit 1
     if is_on; then
-      echo "timer expired" > "$OFFREASON"
-      do_off "timer expired"
+      echo "$WHY" > "$OFFREASON"
+      do_off "$WHY"
     fi
     ;;
 
   on)
     acquire_lock || exit 1
-    do_on "$DUR_SECS"
+    do_on "$DUR_SECS" "$MODE" "$GRACE_SECS"
     ;;
 
   off)
@@ -328,7 +436,7 @@ case "$1" in
     if is_on; then
       do_off
     else
-      do_on "$DUR_SECS"
+      do_on "$DUR_SECS" "$MODE" "$GRACE_SECS"
     fi
     ;;
 
@@ -336,10 +444,17 @@ case "$1" in
     status
     ;;
 
+  check)
+    check
+    ;;
+
   *)
-    echo "Usage: supercaffeinate on [DURATION]|off|toggle [DURATION]|status"
+    echo "Usage: supercaffeinate on [DURATION | claude [GRACE]]|off|toggle [DURATION | claude [GRACE]]|status|check"
     echo "  DURATION: 8h, 90m, 2h30m, 45s, or a bare number of minutes (45)."
     echo "  Omit it (or use 0, inf, forever) to stay awake until off."
+    echo "  claude [GRACE]: stay awake while Claude Code sessions are active;"
+    echo "    off once none has written for GRACE (default 15m) or none is running."
+    echo "  check: health as key=value lines (sudoers, screenblank, stale pmset, watcher, Claude)."
     exit 1
     ;;
 esac

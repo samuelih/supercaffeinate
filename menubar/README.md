@@ -5,33 +5,47 @@ machine is being held awake, and lets you flip it without a terminal.
 
 - Filled cup = on
 - Outline cup = off
-- Warning triangle = the state file exists but the caffeinate pid is dead, so
-  something died badly and `supercaffeinate off` should be run to clean up
+- Warning triangle = the state file exists but the caffeinate pid is dead
+  (something died badly and `supercaffeinate off` should be run to clean up),
+  or caffeinate is alive but the lid watcher is not
 
 The icon is a template SF Symbol, so it follows light and dark menu bars on its
 own. Clicking it opens a menu with the status line ("Awake ∞, since HH:MM"
-when there is no timer, "Awake, 7h 42m left" with one, or "Off"), the lid line
+when there is no timer, "Awake, 7h 42m left (until 19:35)" with one, "Awake
+while Claude runs: 3 sessions, active" in Claude mode, or "Off"), the lid line
 when on ("Lid open: display held awake", "Lid closed: screen black, system
 running", or "Lid closed: showing on external display" in clamshell mode, where
-the script skips the blackout), Turn On / Turn Off items
-that run `~/bin/supercaffeinate on|off`, and Quit.
+the script skips the blackout), the actions, and Quit.
 
-When off there are two ways to turn on: Turn On (indefinite) and Turn On
-For..., which asks for a number of hours (decimals like 0.5 are fine, blank or 0
-means indefinite) and runs `supercaffeinate on <minutes>m`, so the script turns
-itself off when the time is up.
+When off there are three ways to turn on. Turn On is indefinite. Turn On For
+is a submenu: 30 minutes, 1, 2, 4 and 8 hours, Until 7:00 AM (whole minutes
+until the next 07:00), and Custom..., which asks for a number of hours
+(decimals like 0.5 are fine, blank or 0 means indefinite) and runs
+`supercaffeinate on <minutes>m`. Turn On While Claude Runs runs
+`supercaffeinate on claude` and shows how many `claude` processes are running.
 
-## Notifications
+## Health and failures
 
-While the app is running it posts the "ON", "ON for 8h", "OFF" and "OFF (timer
-expired)" notifications itself, with the SuperCaffeinate icon, and the script
-skips its own `osascript` notification. So the app has to be allowed in System
-Settings > Notifications (macOS asks once, on first launch), and in the allow
-list of any Focus mode you want them to break through. Only when the app is not
-running does the script fall back to `osascript`, which shows up as Script
-Editor. The app sees a switch on its next poll, so its notification can arrive
-up to 2 seconds after the change. It never posts for the state it finds at
-launch.
+When the menu opens the app runs `supercaffeinate check` and adds a line per
+problem, each with an action where one makes sense:
+
+- "Setup needed: lid close can still sleep the Mac" when the passwordless
+  `pmset` sudoers rule is missing. Run Setup in Terminal... opens a Terminal
+  window running `supercaffeinate-setup`, which needs an interactive password.
+- "Sleep still disabled from an earlier session" when off but `pmset
+  disablesleep` is still 1 (a reboot while on leaves it that way). Restore
+  Normal Sleep runs `supercaffeinate off`, which clears it without a state file.
+- "Watcher died: lid, timer and Claude checks are off" when the caffeinate pid
+  is alive but the watcher pid is not. Repair runs off, then on again with the
+  same mode and the remaining time.
+- "screenblank missing: run install.sh".
+- "Last run: ..." with the first stderr line of the last script call that
+  failed (non-zero exit, for example the lock held by another run or a bad
+  duration) or printed a warning (for example `sudo -n pmset failed`). It
+  stays until the next clean run.
+
+Each of those is also posted as a notification: the setup and stale-sleep
+problems once at launch, script failures and warnings whenever they happen.
 
 ## How it decides
 
@@ -46,12 +60,16 @@ runs off the main thread so the menu bar never stalls.
 The "since" time comes from the modification time of the state file, which the
 script writes the moment it turns on. When a timer is set, line 4 of the state
 file holds the auto-off deadline (epoch seconds) and the status line shows the
-time left instead, e.g. "Awake, 7h 42m left".
+time left instead, e.g. "Awake, 7h 42m left (until 19:35)". Line 5 is the mode
+(`claude` or empty) and line 6 the Claude grace in seconds. Line 3, the watcher
+pid, is also checked with `kill(pid, 0)` on every poll so a dead watcher shows
+up within 2 seconds.
 
-When the timer runs out, the script writes `timer expired` to
+When the timer runs out or Claude goes idle, the script writes the reason to
 `/tmp/supercaffeinate.offreason` just before its normal off path; a plain off
 never writes it. On the off transition the app reads and deletes that file and
-adds the reason to its notification ("OFF (timer expired)").
+adds the reason to its notification ("OFF (timer expired)", "OFF (Claude idle
+for 15m)", "OFF (no Claude sessions)").
 
 ## Build
 
